@@ -257,8 +257,8 @@ SELECT
     i.installment_no,
     i.due_date,
     DATEDIFF(CURDATE(), i.due_date) AS days_overdue,
-    ROUND(i.amount_due * pl.late_fee_pct / 100 * DATEDIFF(CURDATE(), i.due_date), 2) AS estimated_late_fee,
-    (i.amount_due + i.late_fee + ROUND(i.amount_due * pl.late_fee_pct / 100 * DATEDIFF(CURDATE(), i.due_date), 2)) AS total_payable
+    ROUND(i.amount_due * pl.late_fee_pct / 100 * GREATEST(0, DATEDIFF(CURDATE(), i.due_date)), 2) AS estimated_late_fee,
+    (i.amount_due + i.late_fee + ROUND(i.amount_due * pl.late_fee_pct / 100 * GREATEST(0, DATEDIFF(CURDATE(), i.due_date)), 2)) AS total_payable
 FROM Installments i
 JOIN Bookings b ON i.booking_id = b.booking_id
 JOIN Clients c ON b.client_id = c.client_id
