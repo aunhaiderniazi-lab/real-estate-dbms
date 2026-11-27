@@ -56,7 +56,8 @@ CREATE TABLE Payment_Plans (
 -- 5. Property Bookings (Core Transaction Entity)
 CREATE TABLE Bookings (
     booking_id INT AUTO_INCREMENT PRIMARY KEY,
-    property_id INT UNIQUE NOT NULL,
+    property_id INT NOT NULL,
+    active_property_id INT GENERATED ALWAYS AS (CASE WHEN booking_status = 'Active' THEN property_id ELSE NULL END) STORED,
     client_id INT NOT NULL,
     agent_id INT NOT NULL,
     plan_id INT NOT NULL,
@@ -64,6 +65,7 @@ CREATE TABLE Bookings (
     agreed_price DECIMAL(14,2) NOT NULL,
     remaining_balance DECIMAL(14,2) NOT NULL,
     booking_status ENUM('Active', 'Completed', 'Cancelled') DEFAULT 'Active',
+    UNIQUE KEY uk_active_property (active_property_id),
     FOREIGN KEY (property_id) REFERENCES Properties(property_id),
     FOREIGN KEY (client_id) REFERENCES Clients(client_id),
     FOREIGN KEY (agent_id) REFERENCES Agents(agent_id),
@@ -91,6 +93,7 @@ CREATE TABLE Payments (
     amount_paid DECIMAL(12,2) NOT NULL CHECK (amount_paid > 0),
     payment_method ENUM('Bank Transfer', 'Cheque', 'Cash', 'Online') NOT NULL,
     reference_no VARCHAR(60) UNIQUE NOT NULL,
+    UNIQUE KEY uk_payment_installment (installment_id),   -- one receipt per installment
     FOREIGN KEY (installment_id) REFERENCES Installments(installment_id)
 );
 
@@ -126,6 +129,20 @@ BEGIN
             CONCAT('Property ID ', NEW.property_id, ' booked for PKR ', NEW.agreed_price));
 END//
 
+CREATE TRIGGER trg_after_booking_status_update
+AFTER UPDATE ON Bookings
+FOR EACH ROW
+BEGIN
+    IF OLD.booking_status <> NEW.booking_status AND NEW.booking_status = 'Cancelled' THEN
+        UPDATE Properties
+        SET status = 'Available'
+        WHERE property_id = OLD.property_id;
+        INSERT INTO Audit_Logs (table_name, record_id, action_type, details)
+        VALUES ('Bookings', OLD.booking_id, 'CANCELLED',
+                CONCAT('Booking cancelled; property ', OLD.property_id, ' released'));
+    END IF;
+END//
+
 CREATE TRIGGER trg_after_property_price_update
 AFTER UPDATE ON Properties
 FOR EACH ROW
@@ -148,6 +165,11 @@ CREATE PROCEDURE sp_RecordPayment(
 )
 BEGIN
     DECLARE v_booking_id INT;
+    DECLARE v_amount_due DECIMAL(12,2);
+    DECLARE v_due_date DATE;
+    DECLARE v_status VARCHAR(10);
+    DECLARE v_late_pct DECIMAL(4,2);
+    DECLARE v_late_fee DECIMAL(10,2);
     DECLARE v_due DECIMAL(12,2);
     DECLARE v_property_id INT;
     DECLARE v_new_balance DECIMAL(14,2);
@@ -160,24 +182,41 @@ BEGIN
 
     START TRANSACTION;
 
-    SELECT booking_id, (amount_due + late_fee)
-    INTO v_booking_id, v_due
-    FROM Installments
-    WHERE installment_id = p_installment_id FOR UPDATE;
+    SELECT i.booking_id, i.amount_due, i.due_date, i.status, pl.late_fee_pct
+    INTO v_booking_id, v_amount_due, v_due_date, v_status, v_late_pct
+    FROM Installments i
+    JOIN Bookings b ON i.booking_id = b.booking_id
+    JOIN Payment_Plans pl ON b.plan_id = pl.plan_id
+    WHERE i.installment_id = p_installment_id FOR UPDATE;
+
+    IF v_booking_id IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Installment not found';
+    END IF;
+    IF v_status = 'Paid' THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Installment already paid';
+    END IF;
+
+    SET v_late_fee = ROUND(
+        GREATEST(0, DATEDIFF(CURDATE(), v_due_date)) * (v_amount_due * v_late_pct / 100), 2
+    );
+    SET v_due = v_amount_due + v_late_fee;
 
     IF p_amount < v_due THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Partial installment payment not permitted';
+    END IF;
+    IF p_amount > v_due THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Overpayment is not permitted';
     END IF;
 
     INSERT INTO Payments (installment_id, payment_date, amount_paid, payment_method, reference_no)
     VALUES (p_installment_id, CURDATE(), p_amount, p_method, p_ref);
 
     UPDATE Installments
-    SET status = 'Paid'
+    SET late_fee = v_late_fee, status = 'Paid'
     WHERE installment_id = p_installment_id;
 
     UPDATE Bookings
-    SET remaining_balance = GREATEST(0, remaining_balance - p_amount)
+    SET remaining_balance = remaining_balance - p_amount
     WHERE booking_id = v_booking_id;
 
     SELECT remaining_balance, property_id
@@ -218,9 +257,11 @@ SELECT
     i.installment_no,
     i.due_date,
     DATEDIFF(CURDATE(), i.due_date) AS days_overdue,
-    (i.amount_due + i.late_fee) AS total_payable
+    ROUND(i.amount_due * pl.late_fee_pct / 100 * DATEDIFF(CURDATE(), i.due_date), 2) AS estimated_late_fee,
+    (i.amount_due + i.late_fee + ROUND(i.amount_due * pl.late_fee_pct / 100 * DATEDIFF(CURDATE(), i.due_date), 2)) AS total_payable
 FROM Installments i
 JOIN Bookings b ON i.booking_id = b.booking_id
 JOIN Clients c ON b.client_id = c.client_id
 JOIN Properties p ON b.property_id = p.property_id
+JOIN Payment_Plans pl ON b.plan_id = pl.plan_id
 WHERE i.status <> 'Paid' AND i.due_date < CURDATE();
